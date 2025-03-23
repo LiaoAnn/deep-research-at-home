@@ -10,6 +10,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from open_webui.constants import TASKS
 from open_webui.main import generate_chat_completions
 from open_webui.models.users import User
+from urllib.parse import quote, urlparse, parse_qsl, urlencode, urlunparse
 
 name = "DeepResearch"
 
@@ -468,11 +469,26 @@ class Pipe:
     async def _fallback_search(self, query: str) -> List[Dict]:
         """Fallback search method using direct HTTP request to search API"""
         try:
-            # URL encode the query for safer search
-            from urllib.parse import quote
+            # 解析 URL
+            parsed_url = urlparse(self.valves.SEARCH_URL)
 
-            encoded_query = quote(query)
-            search_url = f"{self.valves.SEARCH_URL}{encoded_query}"
+            # 解析查詢字串到字典
+            query_params = dict(parse_qsl(parsed_url.query))
+
+            # 如果 format 不存在，設定為 json
+            if "format" not in query_params:
+                query_params["format"] = "json"
+
+            # 添加查詢參數
+            query_params["q"] = quote(query)
+
+            # 重建查詢字串
+            new_query = urlencode(query_params)
+
+            # 重建完整 URL
+            url_parts = list(parsed_url)
+            url_parts[4] = new_query
+            search_url = urlunparse(url_parts)
 
             logger.debug(f"Using fallback search with URL: {search_url}")
 
