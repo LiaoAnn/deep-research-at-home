@@ -153,30 +153,34 @@ class Pipe:
         self.type = "manifold"
         self.valves = self.Valves()
         self.prev_comprehensive_summary = ""  # Store the previous comprehensive answer
-
-    def pipes(self) -> list[dict[str, str]]:
-        return [{"id": f"{name}-pipe", "name": f"{name} Pipe"}]
+        self._search_cache: Dict[str, List[Dict]] = {}
+        self.embedding_semaphore = asyncio.Semaphore(10)  # 限制同時 get_embedding 的數量
+        # 編譯正則，避免重複建構
+        self._script_re = re.compile(r"<script[^>]*>.*?</script>", re.DOTALL)
+        self._style_re = re.compile(r"<style[^>]*>.*?</style>", re.DOTALL)
+        self._head_re = re.compile(r"<head[^>]*>.*?</head>", re.DOTALL)
+        self._tag_re = re.compile(r"<[^>]*>")
 
     async def get_embedding(self, text: str) -> Optional[List[float]]:
         """Get embedding for a text string using the configured embedding model"""
         if not text or not text.strip():
             return None
 
-        async with aiohttp.ClientSession() as session:
-            payload = {
-                "model": self.valves.EMBEDDING_MODEL,
-                "prompt": text,
-            }
-
+        payload = {
+            "model": self.valves.EMBEDDING_MODEL,
+            "prompt": text,
+        }
+        async with self.embedding_semaphore:  # 限制同時請求數量
             try:
-                async with session.post(
-                    f"{self.valves.OLLAMA_URL}/api/embeddings", json=payload, timeout=30
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        embedding = result.get("embedding", [])
-                        if embedding:
-                            return embedding
+                async with aiohttp.ClientSession() as session:  # 使用 async with
+                    async with session.post(
+                        f"{self.valves.OLLAMA_URL}/api/embeddings", json=payload, timeout=30
+                    ) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            embedding = result.get("embedding", [])
+                            if embedding:
+                                return embedding
             except Exception as e:
                 logger.error(f"Error getting embedding: {e}")
 
@@ -271,12 +275,9 @@ class Pipe:
         if len(chunks) <= 1:
             return content
 
-        # Get embeddings for chunks
-        chunk_embeddings = []
-        for chunk in chunks:
-            embedding = await self.get_embedding(chunk)
-            if embedding:
-                chunk_embeddings.append(embedding)
+        # 取得所有區塊的向量（改為並行執行以優化效能）
+        embedding_results = await asyncio.gather(*[self.get_embedding(chunk) for chunk in chunks])
+        chunk_embeddings = [emb for emb in embedding_results if emb]
 
         # Skip compression if not enough embeddings
         if len(chunk_embeddings) <= 1:
@@ -402,10 +403,11 @@ class Pipe:
             logger.debug(f"Executing built-in search with query: {query}")
 
             # Set a timeout for this operation
-            search_task = asyncio.create_task(
-                process_web_search(self.__request__, search_form, user=self.__user__)
-            )
-            search_results = await asyncio.wait_for(search_task, timeout=15.0)
+            async with aiohttp.ClientSession() as session:  # 使用 async with
+                search_task = asyncio.create_task(
+                    process_web_search(self.__request__, search_form, user=self.__user__)
+                )
+                search_results = await asyncio.wait_for(search_task, timeout=15.0)
 
             logger.debug(f"Search results received: {type(search_results)}")
             results = []
@@ -542,53 +544,51 @@ class Pipe:
             return []
 
     async def search_web(self, query: str) -> List[Dict]:
-        """Perform web search with fallbacks"""
+        """Perform web search with fallbacks and caching"""
         logger.debug(f"Starting web search for query: {query}")
 
+        # Check cache first
+        if query in self._search_cache:
+            logger.debug(f"Using cached results for query: {query}")
+            return self._search_cache[query]
+
         # First try OpenWebUI search
-        results = await self._try_openwebui_search(query)
+        openwebui_results = self._try_openwebui_search(query)
 
         # If that failed, try fallback search
-        if not results:
-            logger.debug(
-                f"OpenWebUI search returned no results, trying fallback search for: {query}"
-            )
-            results = await self._fallback_search(query)
+        fallback_results = self._fallback_search(query)
 
-        # If we got results, return them
+        results = await asyncio.gather(openwebui_results, fallback_results)
+        results = results[0] if results[0] else results[1]
+
+        # If we got results, cache and return them
         if results:
             logger.debug(
                 f"Search successful, found {len(results)} results for: {query}"
             )
+            self._search_cache[query] = results
             return results
 
         # No results - create a minimal result
         logger.warning(f"No search results found for query: {query}")
-        return [
+        minimal_result = [
             {
                 "title": f"No results for '{query}'",
                 "url": "",
                 "snippet": f"No search results were found for the query: {query}",
             }
         ]
+        self._search_cache[query] = minimal_result
+        return minimal_result
 
     async def extract_text_from_html(self, html_content: str) -> str:
         """Extract meaningful text content from HTML"""
         try:
-            # Quick regex extraction first
-            import re
-
-            # Remove script and style tags
-            content = re.sub(
-                r"<script[^>]*>.*?</script>", " ", html_content, flags=re.DOTALL
-            )
-            content = re.sub(r"<style[^>]*>.*?</style>", " ", content, flags=re.DOTALL)
-            content = re.sub(r"<head[^>]*>.*?</head>", " ", content, flags=re.DOTALL)
-
-            # Remove HTML tags
-            content = re.sub(r"<[^>]*>", " ", content)
-
-            # Cleanup whitespace
+            # 利用預編譯正則表達式移除不需要的標籤
+            content = self._script_re.sub(" ", html_content)
+            content = self._style_re.sub(" ", content)
+            content = self._head_re.sub(" ", content)
+            content = self._tag_re.sub(" ", content)
             content = re.sub(r"\s+", " ", content).strip()
 
             # Try BeautifulSoup if available
@@ -629,9 +629,7 @@ class Pipe:
             logger.error(f"Error extracting text from HTML: {e}")
             # Simple fallback - remove all HTML tags
             try:
-                import re
-
-                return re.sub(r"<[^>]*>", " ", html_content)
+                return self._tag_re.sub(" ", html_content)
             except:
                 return html_content
 
@@ -2012,4 +2010,20 @@ The user will only see your final synthesis, not the research process. Your synt
 
         # Complete the process
         await self.emit_status("success", "Deep research complete!", True)
+        
+        # 清除 cache 相關內容
+        await self.clear_cache()
+        
         return ""
+
+    async def clear_cache(self):
+        """清除所有快取相關的變數和物件."""
+        logger.info("Clearing cache...")
+        # 清除搜尋快取
+        self._search_cache = {}
+        # 清除先前的總結
+        self.prev_comprehensive_summary = ""
+        # 執行垃圾回收
+        import gc
+        gc.collect()
+        logger.info("Cache cleared.")
