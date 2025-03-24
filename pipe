@@ -1082,13 +1082,17 @@ Format your summary with clear paragraphs and appropriate organization.""",
                             f"Fetching snippet from {result['url'][:30]}...",
                             False,
                         )
-                        snippet_content = await self.fetch_content(result["url"])
-                        if snippet_content:
-                            snippet = snippet_content[
-                                : self.valves.RELEVANCY_SNIPPET_LENGTH
-                            ]
+                        # 檢查 fetch_content 是否存在且可被呼叫
+                        if callable(getattr(self, "fetch_content", None)):
+                            snippet_content = await self.fetch_content(result["url"])
+                            if snippet_content:
+                                snippet = snippet_content[
+                                    : self.valves.RELEVANCY_SNIPPET_LENGTH
+                                ]
+                        else:
+                            logger.error("fetch_content method is not available")
                     except Exception as e:
-                        logger.error(f"Error fetching content for relevance check: {e}")
+                        logger.error(f"Error fetching content for relevance check: {str(e)}")
 
                 # If we have content, get its embedding and calculate similarity
                 if snippet and len(snippet) > 100:
